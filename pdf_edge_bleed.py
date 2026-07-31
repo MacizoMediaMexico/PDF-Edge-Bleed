@@ -8,9 +8,26 @@ import threading
 from PIL import Image
 import io
 import math
+import re
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    DND_AVAILABLE = True
+except ImportError:
+    TkinterDnD = None
+    DND_FILES = None
+    DND_AVAILABLE = False
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
+
+
+def parse_dnd_paths(data):
+    if not data:
+        return []
+    data = data.replace('file://', '')
+    matches = re.findall(r'\{([^}]+)\}|(\S+)', data)
+    return [m[0] or m[1] for m in matches]
 
 
 def detect_colorspace(input_path):
@@ -403,6 +420,14 @@ class App:
         self.processing = False
         self.dark_mode = False
         self.edge_sample_inches = 0.05
+        self.input_files = []
+        self.batch_success_count = 0
+        self.batch_fail_count = 0
+        self.batch_output_files = []
+
+        if DND_AVAILABLE:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>', self.on_drop)
 
         self.palettes = {
             "light": {
@@ -472,7 +497,7 @@ class App:
         self.subtitle_label.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 4))
 
         self.version_label = ctk.CTkLabel(
-            self.header_frame, text="V2.0\nMade by Douglas C.",
+            self.header_frame, text="V2.02\nMade by Douglas C.",
             font=("Segoe UI", 10, "bold"), justify="right",
         )
         self.version_label.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(0, 24), pady=(18, 4))
@@ -577,63 +602,70 @@ class App:
         self.files_card = ctk.CTkFrame(
             self.main_frame, corner_radius=12, border_width=1,
         )
-        self.files_card.pack(fill=ctk.X, pady=(0, 12))
+        self.files_card.pack(fill=ctk.BOTH, expand=True, pady=(0, 12))
+        self.files_card.grid_rowconfigure(3, weight=1)
+        self.files_card.grid_columnconfigure(0, weight=1)
 
         self.files_title = ctk.CTkLabel(
             self.files_card, text="Files",
             font=("Segoe UI", 16, "bold"),
         )
-        self.files_title.pack(anchor="w", padx=24, pady=(20, 12))
+        self.files_title.grid(row=0, column=0, sticky="w", padx=24, pady=(20, 8))
 
-        self.input_file = ctk.StringVar()
-
-        input_label = ctk.CTkLabel(
-            self.files_card, text="Original PDF file",
-            font=("Segoe UI", 10, "bold"),
+        self.drop_zone = ctk.CTkFrame(
+            self.files_card, corner_radius=8, border_width=2,
+            height=70, cursor="hand2",
         )
-        input_label.pack(anchor="w", padx=24)
+        self.drop_zone.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 8))
+        self.drop_zone.grid_propagate(False)
+        self.drop_zone.grid_columnconfigure(0, weight=1)
+        self.drop_zone.grid_rowconfigure(0, weight=1)
 
-        in_frame = ctk.CTkFrame(self.files_card, fg_color="transparent")
-        in_frame.pack(fill=ctk.X, padx=24, pady=(8, 16))
-
-        self.input_entry = ctk.CTkEntry(
-            in_frame, textvariable=self.input_file,
-            font=("Consolas", 10), corner_radius=8, height=36,
+        self.drop_label = ctk.CTkLabel(
+            self.drop_zone,
+            text="Drag & drop PDF file(s) here or click to select",
+            font=("Segoe UI", 12),
         )
-        self.input_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True, padx=(0, 10))
+        self.drop_label.grid(row=0, column=0, sticky="nsew", padx=16, pady=12)
+
+        self.drop_zone.bind("<Button-1>", lambda e: self.browse_input())
+        self.drop_label.bind("<Button-1>", lambda e: self.browse_input())
+
+        btn_row = ctk.CTkFrame(self.files_card, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 8))
+        btn_row.grid_columnconfigure(0, weight=1)
 
         self.browse_input_btn = ctk.CTkButton(
-            in_frame, text="Browse",
+            btn_row, text="Add PDFs",
             command=self.browse_input,
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 11, "bold"),
             corner_radius=8, height=36, cursor="hand2",
         )
-        self.browse_input_btn.pack(side=ctk.RIGHT)
+        self.browse_input_btn.grid(row=0, column=0, sticky="w")
 
-        self.output_file = ctk.StringVar()
-
-        output_label = ctk.CTkLabel(
-            self.files_card, text="Save as",
-            font=("Segoe UI", 10, "bold"),
-        )
-        output_label.pack(anchor="w", padx=24)
-
-        out_frame = ctk.CTkFrame(self.files_card, fg_color="transparent")
-        out_frame.pack(fill=ctk.X, padx=24, pady=(8, 20))
-
-        self.output_entry = ctk.CTkEntry(
-            out_frame, textvariable=self.output_file,
-            font=("Consolas", 10), corner_radius=8, height=36,
-        )
-        self.output_entry.pack(side=ctk.LEFT, fill=ctk.X, expand=True, padx=(0, 10))
-
-        self.browse_output_btn = ctk.CTkButton(
-            out_frame, text="Browse",
-            command=self.browse_output,
-            font=("Segoe UI", 10, "bold"),
+        self.clear_btn = ctk.CTkButton(
+            btn_row, text="Clear",
+            command=self.clear_files,
+            font=("Segoe UI", 11, "bold"),
             corner_radius=8, height=36, cursor="hand2",
+            fg_color="#EF4444", hover_color="#DC2626",
+            text_color="#FFFFFF",
         )
-        self.browse_output_btn.pack(side=ctk.RIGHT)
+        self.clear_btn.grid(row=0, column=1, sticky="e", padx=(10, 0))
+
+        self.file_list_box = ctk.CTkTextbox(
+            self.files_card, font=("Consolas", 10),
+            corner_radius=8, wrap="none", height=80,
+        )
+        self.file_list_box.grid(row=3, column=0, sticky="nsew", padx=24, pady=(0, 20))
+        self.file_list_box.insert("0.0", "No files selected.")
+        self.file_list_box.configure(state="disabled")
+
+        self.file_count_label = ctk.CTkLabel(
+            self.files_card, text="0 files",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.file_count_label.grid(row=4, column=0, sticky="w", padx=24, pady=(0, 16))
 
     def _build_button(self):
         self.btn_run = ctk.CTkButton(
@@ -682,7 +714,11 @@ class App:
         self.palette = dict(self.palettes[mode])
         c = self.palette
 
-        self.root.configure(fg_color=c["bg"])
+        try:
+            self.root.configure(fg_color=c["bg"])
+        except Exception:
+            self.root.configure(bg=c["bg"])
+
         self.main_frame.configure(fg_color=c["bg"])
 
         self.header_frame.configure(fg_color=c["card"], border_color=c["card_border"])
@@ -715,25 +751,27 @@ class App:
         self.files_title.configure(text_color=c["text"])
 
         for w in self.files_card.winfo_children():
-            if isinstance(w, ctk.CTkLabel) and w not in [self.files_title]:
+            if isinstance(w, ctk.CTkLabel) and w not in [self.files_title, self.file_count_label]:
                 w.configure(text_color=c["label"])
+            elif isinstance(w, ctk.CTkTextbox):
+                w.configure(
+                    fg_color=c["input_bg"], text_color=c["text"],
+                    border_color=c["input_border"],
+                )
 
-        self.input_entry.configure(
-            fg_color=c["input_bg"], text_color=c["text"],
-            border_color=c["input_border"],
-        )
-        self.output_entry.configure(
-            fg_color=c["input_bg"], text_color=c["text"],
-            border_color=c["input_border"],
-        )
+        self.file_count_label.configure(text_color=c["label"])
         self.browse_input_btn.configure(
             fg_color=c["primary"], hover_color=c["primary_hover"],
             text_color="#FFFFFF",
         )
-        self.browse_output_btn.configure(
-            fg_color=c["primary"], hover_color=c["primary_hover"],
-            text_color="#FFFFFF",
+        self.file_list_box.configure(
+            fg_color=c["input_bg"], text_color=c["text"],
+            border_color=c["input_border"],
         )
+        self.drop_zone.configure(
+            fg_color=c["input_bg"], border_color=c["accent"],
+        )
+        self.drop_label.configure(text_color=c["muted"])
 
         self.btn_run.configure(
             fg_color=c["primary"],
@@ -775,22 +813,52 @@ class App:
         self.bleed_dpi_var.set(dpi)
         self.dpi_label.configure(text=f"{dpi} DPI")
 
-    def browse_input(self):
-        f = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
-        if f:
-            self.input_file.set(f)
-            base = os.path.splitext(f)[0]
-            self.output_file.set(f"{base}_EDGE_BLEED.pdf")
-            self.write_log(f"File selected: {os.path.basename(f)}")
+    def clear_files(self):
+        self.input_files = []
+        self._update_file_list_display()
 
-    def browse_output(self):
-        f = filedialog.asksaveasfilename(
-            defaultextension=".pdf",
+    def on_drop(self, event):
+        if self.processing:
+            return
+        raw_data = event.data
+        paths = parse_dnd_paths(raw_data)
+        if not paths:
+            return
+        added = 0
+        for path in paths:
+            if os.path.isfile(path) and path.lower().endswith(".pdf"):
+                if path not in self.input_files:
+                    self.input_files.append(path)
+                    added += 1
+        if added:
+            self._update_file_list_display()
+            self.write_log(f"{added} PDF file(s) dropped.")
+        else:
+            self.write_log("No valid PDF files in the drop.")
+
+    def _update_file_list_display(self):
+        self.file_list_box.configure(state="normal")
+        self.file_list_box.delete("0.0", "end")
+        if not self.input_files:
+            self.file_list_box.insert("0.0", "No files selected.")
+            self.file_count_label.configure(text="0 files")
+        else:
+            for i, path in enumerate(self.input_files, 1):
+                self.file_list_box.insert("end", f"{i}. {os.path.basename(path)}\n")
+            self.file_count_label.configure(text=f"{len(self.input_files)} file(s)")
+        self.file_list_box.configure(state="disabled")
+
+    def browse_input(self):
+        files = filedialog.askopenfilenames(
             filetypes=[("PDF Files", "*.pdf")],
+            title="Select PDF file(s)",
+            multiple=True,
         )
-        if f:
-            self.output_file.set(f)
-            self.write_log(f"Destination set: {os.path.basename(f)}")
+        if files:
+            self.input_files.extend(files)
+            self._update_file_list_display()
+            for f in files:
+                self.write_log(f"Added: {os.path.basename(f)}")
 
     def write_log(self, text):
         self.log.insert(ctk.END, f"{text}\n")
@@ -836,20 +904,14 @@ class App:
             self.show_warning("Warning", "A process is already running.")
             return
 
-        input_path = self.input_file.get().strip()
-        output_path = self.output_file.get().strip()
-
-        if not input_path or not output_path:
-            self.show_warning("Warning", "Please select input and output files.")
+        if not self.input_files:
+            self.show_warning("Warning", "Please add PDF files first.")
             return
 
-        if not os.path.exists(input_path):
-            self.show_error("Error", "The input file does not exist.")
-            return
-
-        if input_path == output_path:
-            self.show_error("Error", "Output file must be different from input file.")
-            return
+        for path in self.input_files:
+            if not os.path.exists(path):
+                self.show_error("Error", f"File does not exist:\n{path}")
+                return
 
         self.processing = True
         self.btn_run.configure(
@@ -875,8 +937,7 @@ class App:
 
         self.write_log("")
         self.write_log("=" * 60)
-        self.write_log(f"Input: {os.path.basename(input_path)}")
-        self.write_log(f"Output: {os.path.basename(output_path)}")
+        self.write_log(f"Files to process: {len(self.input_files)}")
         self.write_log("Bleed: 0.125\" (9 points)")
         self.write_log(f"Internal Edge Sample: {edge_sample:.2f}\"")
         self.write_log(f"White Edge Skip: {edge_skip_summary}")
@@ -885,66 +946,119 @@ class App:
         self.write_log("Method: Edge Extension with inset sampling")
         self.write_log("=" * 60)
 
+        files = list(self.input_files)
         thread = threading.Thread(
-            target=self.run_logic,
-            args=(input_path, output_path, edge_sample, bleed_dpi, edge_inset_px, flatten_page),
+            target=self.run_batch,
+            args=(files, edge_sample, bleed_dpi, edge_inset_px, flatten_page),
             daemon=True,
         )
         thread.start()
 
-    def run_logic(self, i, o, edge_sample, bleed_dpi, edge_inset_px, flatten_page):
-        def progress_callback(value, label):
-            self.root.after(0, lambda: self.update_progress(value, label))
+    def compute_total_pages(self, files):
+        total = 0
+        for path in files:
+            try:
+                doc = fitz.open(path)
+                total += len(doc)
+                doc.close()
+            except Exception:
+                total += 1
+        return total
 
-        success = create_mirror_bleed(
-            i, o,
-            self.write_log_threadsafe,
-            progress_callback,
-            edge_sample_inches=edge_sample,
-            bleed_dpi=bleed_dpi,
-            edge_inset_px=edge_inset_px,
-            flatten_page=flatten_page,
-        )
-        self.root.after(0, lambda: self.finish(success))
+    def run_batch(self, files, edge_sample, bleed_dpi, edge_inset_px, flatten_page):
+        total_pages_all = self.compute_total_pages(files)
+        pages_done = 0
+        self.batch_success_count = 0
+        self.batch_fail_count = 0
+        self.batch_output_files = []
 
-    def finish(self, success):
+        for idx, input_path in enumerate(files):
+            base = os.path.splitext(input_path)[0]
+            output_path = f"{base}_EDGE_BLEED.pdf"
+            fname = os.path.basename(input_path)
+
+            self.root.after(0, lambda f=fname: self.write_log(f"\n--- Processing ({idx+1}/{len(files)}): {f}"))
+
+            pages_in_file = 0
+            try:
+                doc = fitz.open(input_path)
+                pages_in_file = len(doc)
+                doc.close()
+            except Exception:
+                pages_in_file = 1
+
+            def make_progress(base_progress, file_progress, label_text):
+                overall = base_progress + (file_progress * pages_in_file / total_pages_all)
+                self.root.after(0, lambda: self.update_progress(overall * 100, label_text))
+
+            current_base = pages_done / total_pages_all if total_pages_all else 0
+
+            success = create_mirror_bleed(
+                input_path, output_path,
+                self.write_log_threadsafe,
+                lambda p, lbl: make_progress(current_base, p / 100, lbl),
+                edge_sample_inches=edge_sample,
+                bleed_dpi=bleed_dpi,
+                edge_inset_px=edge_inset_px,
+                flatten_page=flatten_page,
+            )
+
+            pages_done += pages_in_file
+
+            if success:
+                self.batch_success_count += 1
+                self.batch_output_files.append(output_path)
+                self.root.after(0, lambda f=fname: self.write_log(f"  ✓ {f} done"))
+            else:
+                self.batch_fail_count += 1
+                self.root.after(0, lambda f=fname: self.write_log(f"  ✗ {f} failed"))
+
+        self.root.after(0, self.finish_batch)
+
+    def finish_batch(self):
         self.processing = False
         self.progress.set(1.0)
+        total = len(self.input_files)
 
-        if success:
+        edge_skip_summary = (
+            f"Top {self.last_edge_insets['top']}px | Bottom {self.last_edge_insets['bottom']}px | "
+            f"Left {self.last_edge_insets['left']}px | Right {self.last_edge_insets['right']}px"
+        )
+        flatten_summary = "ON" if self.last_flatten_page else "OFF"
+
+        self.write_log("")
+        self.write_log("=" * 60)
+        self.write_log(f"BATCH COMPLETE: {self.batch_success_count}/{total} succeeded")
+        if self.batch_fail_count:
+            self.write_log(f"Failures: {self.batch_fail_count}")
+        self.write_log("=" * 60)
+
+        if self.batch_fail_count == 0:
             self.progress_label.configure(text="Completed - 100%")
-            self.write_log("")
-            self.write_log("=" * 60)
-            self.write_log("PROCESS COMPLETED SUCCESSFULLY")
-            self.write_log("=" * 60)
-            self.write_log(f"File saved at: {self.output_file.get()}")
-            edge_skip_summary = (
-                f"Top {self.last_edge_insets['top']}px | Bottom {self.last_edge_insets['bottom']}px | "
-                f"Left {self.last_edge_insets['left']}px | Right {self.last_edge_insets['right']}px"
-            )
-            flatten_summary = "ON" if self.last_flatten_page else "OFF"
-
+            details = "\n".join(self.batch_output_files)
             self.show_success(
                 "Success",
-                "PDF with edge-extended bleed generated successfully.\n\n"
-                "Vector content preserved\n"
+                f"All {total} PDF(s) processed successfully.\n\n"
                 f"{int(self.bleed_dpi_var.get())} DPI bleed quality\n"
-                "Bleed color matched to rendered PDF appearance\n"
                 f"White edge skip applied: {edge_skip_summary}\n"
                 f"Flatten transparency mode: {flatten_summary}\n"
                 "Ready for professional print",
-                f"File saved at: {self.output_file.get()}",
+                f"Files saved:\n{details}",
             )
-
-            if self.show_confirm("Open file", "Do you want to open the resulting PDF?"):
-                self.open_file(self.output_file.get())
+        elif self.batch_success_count > 0:
+            self.progress_label.configure(text=f"Partial - {self.batch_success_count}/{total} succeeded")
+            details = "\n".join(self.batch_output_files)
+            self.show_error(
+                "Partial Success",
+                f"{self.batch_success_count}/{total} file(s) succeeded.\n"
+                f"{self.batch_fail_count} file(s) failed.\nCheck the log for details.",
+                f"Successful files:\n{details}",
+            )
         else:
             self.progress_label.configure(text="Failed")
-            self.write_log("")
-            self.write_log("PROCESS FAILED - Check log for details")
             self.show_error(
                 "Error",
-                "An error occurred during processing.\nCheck the log for more details.",
+                "All files failed to process.\nCheck the log for details.",
             )
 
         self.btn_run.configure(
@@ -954,6 +1068,19 @@ class App:
 
 
 if __name__ == "__main__":
-    root = ctk.CTk()
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+    if DND_AVAILABLE:
+        try:
+            root = TkinterDnD.Tk()
+        except Exception:
+            root = ctk.CTk()
+    else:
+        root = ctk.CTk()
+
     app = App(root)
     root.mainloop()
