@@ -67,6 +67,39 @@ def clamp_crop_box(left, top, right, bottom, image_width, image_height):
     return left, top, right, bottom
 
 
+def append_vector_mirrors(new_page, form_name, bleed_pts, w, h):
+    doc = new_page.parent
+    xref = new_page.get_contents()[0]
+    stream = doc.xref_stream(xref)
+    blocks = []
+
+    def block(rect, cm):
+        blocks.append(
+            b"q %.4f %.4f %.4f %.4f re W n %s cm /%s Do Q\n"
+            % (rect.x0, rect.y0, rect.width, rect.height,
+               cm.encode(), form_name.encode())
+        )
+
+    block(fitz.Rect(0, h + bleed_pts, w + 2 * bleed_pts, h + 2 * bleed_pts),
+          "1 0 0 -1 0 %.4f" % (2 * (h + bleed_pts)))
+    block(fitz.Rect(0, 0, w + 2 * bleed_pts, bleed_pts),
+          "1 0 0 -1 0 %.4f" % (2 * bleed_pts))
+    block(fitz.Rect(0, 0, bleed_pts, h + 2 * bleed_pts),
+          "-1 0 0 1 %.4f 0" % (2 * bleed_pts))
+    block(fitz.Rect(w + bleed_pts, 0, w + 2 * bleed_pts, h + 2 * bleed_pts),
+          "-1 0 0 1 %.4f 0" % (2 * (w + bleed_pts)))
+    block(fitz.Rect(0, h + bleed_pts, bleed_pts, h + 2 * bleed_pts),
+          "-1 0 0 -1 %.4f %.4f" % (2 * bleed_pts, 2 * (h + bleed_pts)))
+    block(fitz.Rect(w + bleed_pts, h + bleed_pts, w + 2 * bleed_pts, h + 2 * bleed_pts),
+          "-1 0 0 -1 %.4f %.4f" % (2 * (w + bleed_pts), 2 * (h + bleed_pts)))
+    block(fitz.Rect(0, 0, bleed_pts, bleed_pts),
+          "-1 0 0 -1 %.4f %.4f" % (2 * bleed_pts, 2 * bleed_pts))
+    block(fitz.Rect(w + bleed_pts, 0, w + 2 * bleed_pts, bleed_pts),
+          "-1 0 0 -1 %.4f %.4f" % (2 * (w + bleed_pts), 2 * bleed_pts))
+
+    new_page.parent.update_stream(xref, stream + b"\n" + b"".join(blocks))
+
+
 def create_mirror_bleed(
     input_path,
     output_path,
@@ -76,6 +109,7 @@ def create_mirror_bleed(
     bleed_dpi=360,
     edge_inset_px=0,
     flatten_page=False,
+    vector_bleed=False,
 ):
     doc = None
     new_doc = None
@@ -106,26 +140,35 @@ def create_mirror_bleed(
             }
         seam_cover_px = {side: min(value, 24) for side, value in edge_insets.items()}
         seam_cover_pts = {side: value / dpi_scale for side, value in seam_cover_px.items()}
+        if vector_bleed and flatten_page:
+            if log_callback:
+                log_callback(
+                    "Vector mode is incompatible with Flatten transparency; "
+                    "Flatten forced OFF."
+                )
+            flatten_page = False
         doc = fitz.open(input_path)
         new_doc = fitz.open()
         total_pages = len(doc)
         if log_callback:
-            log_callback(f"Edge Extension Engine - Vector + {bleed_dpi} DPI Bleed")
+            mode_label = "Vector Mirror" if vector_bleed else f"Raster @ {bleed_dpi} DPI"
+            log_callback(f"Edge Extension Engine - Bleed Mode: {mode_label}")
             log_callback(f"Color Space Detected: {colorspace}")
-            log_callback("Bleed Render Mode: RGB appearance match")
-            log_callback(f"Flatten Transparency Mode: {'ON' if flatten_page else 'OFF'}")
-            log_callback(f"Edge Sample: {edge_sample_inches:.2f}\" (~{sample_px}px)")
-            log_callback(
-                "White Edge Skip: "
-                f"Top {edge_insets['top']}px | Bottom {edge_insets['bottom']}px | "
-                f"Left {edge_insets['left']}px | Right {edge_insets['right']}px"
-            )
-            log_callback(
-                "Inner Seam Cover: "
-                f"Top {seam_cover_px['top']}px | Bottom {seam_cover_px['bottom']}px | "
-                f"Left {seam_cover_px['left']}px | Right {seam_cover_px['right']}px"
-            )
-            log_callback("Outer Edge Overlap: 2px")
+            if not vector_bleed:
+                log_callback("Bleed Render Mode: RGB appearance match")
+                log_callback(f"Flatten Transparency Mode: {'ON' if flatten_page else 'OFF'}")
+                log_callback(f"Edge Sample: {edge_sample_inches:.2f}\" (~{sample_px}px)")
+                log_callback(
+                    "White Edge Skip: "
+                    f"Top {edge_insets['top']}px | Bottom {edge_insets['bottom']}px | "
+                    f"Left {edge_insets['left']}px | Right {edge_insets['right']}px"
+                )
+                log_callback(
+                    "Inner Seam Cover: "
+                    f"Top {seam_cover_px['top']}px | Bottom {seam_cover_px['bottom']}px | "
+                    f"Left {seam_cover_px['left']}px | Right {seam_cover_px['right']}px"
+                )
+                log_callback("Outer Edge Overlap: 2px")
             log_callback(f"Bleed Extension: {bleed_inches}\"")
             log_callback(f"Processing {total_pages} page(s)...")
         for page_index in range(total_pages):
@@ -136,133 +179,140 @@ def create_mirror_bleed(
             new_h = h + (2 * bleed_pts)
             new_page = new_doc.new_page(width=new_w, height=new_h)
             main_rect = fitz.Rect(bleed_pts, bleed_pts, w + bleed_pts, h + bleed_pts)
-            pix = page.get_pixmap(
-                matrix=fitz.Matrix(dpi_scale, dpi_scale),
-                colorspace=fitz.csRGB,
-                alpha=False,
-            )
-            page_img = Image.open(io.BytesIO(pix.tobytes("png")))
-            page_img = page_img.convert("RGB")
-            page_w_px, page_h_px = page_img.size
-            if flatten_page:
-                full_page_bytes = io.BytesIO()
-                page_img.save(full_page_bytes, format="PNG")
-                new_page.insert_image(main_rect, stream=full_page_bytes.getvalue())
-            else:
+            if vector_bleed:
                 new_page.show_pdf_page(main_rect, doc, page_index)
-            max_inset_x = max(0, (page_w_px - sample_px - 1) // 2)
-            max_inset_y = max(0, (page_h_px - sample_px - 1) // 2)
-            inset_top = min(edge_insets["top"], max_inset_y)
-            inset_bottom = min(edge_insets["bottom"], max_inset_y)
-            inset_left = min(edge_insets["left"], max_inset_x)
-            inset_right = min(edge_insets["right"], max_inset_x)
-            limited_insets = (
-                inset_top != edge_insets["top"]
-                or inset_bottom != edge_insets["bottom"]
-                or inset_left != edge_insets["left"]
-                or inset_right != edge_insets["right"]
-            )
-            if any(edge_insets.values()) and log_callback and limited_insets:
-                log_callback(
-                    f"  Page {page_index + 1}: one or more inset values were limited "
-                    "because the page is small."
+                form_name = [
+                    t[1] for t in new_page.get_xobjects() if t[1].startswith("fzFrm")
+                ][0]
+                append_vector_mirrors(new_page, form_name, bleed_pts, w, h)
+            else:
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(dpi_scale, dpi_scale),
+                    colorspace=fitz.csRGB,
+                    alpha=False,
                 )
+                page_img = Image.open(io.BytesIO(pix.tobytes("png")))
+                page_img = page_img.convert("RGB")
+                page_w_px, page_h_px = page_img.size
+                if flatten_page:
+                    full_page_bytes = io.BytesIO()
+                    page_img.save(full_page_bytes, format="PNG")
+                    new_page.insert_image(main_rect, stream=full_page_bytes.getvalue())
+                else:
+                    new_page.show_pdf_page(main_rect, doc, page_index)
+                max_inset_x = max(0, (page_w_px - sample_px - 1) // 2)
+                max_inset_y = max(0, (page_h_px - sample_px - 1) // 2)
+                inset_top = min(edge_insets["top"], max_inset_y)
+                inset_bottom = min(edge_insets["bottom"], max_inset_y)
+                inset_left = min(edge_insets["left"], max_inset_x)
+                inset_right = min(edge_insets["right"], max_inset_x)
+                limited_insets = (
+                    inset_top != edge_insets["top"]
+                    or inset_bottom != edge_insets["bottom"]
+                    or inset_left != edge_insets["left"]
+                    or inset_right != edge_insets["right"]
+                )
+                if any(edge_insets.values()) and log_callback and limited_insets:
+                    log_callback(
+                        f"  Page {page_index + 1}: one or more inset values were limited "
+                        "because the page is small."
+                    )
 
-            def crop_resize(box, size, flip_h=False, flip_v=False):
-                box = clamp_crop_box(*box, page_w_px, page_h_px)
-                strip = page_img.crop(box)
-                strip = strip.resize(size, Image.LANCZOS)
-                if flip_h:
-                    strip = strip.transpose(Image.FLIP_LEFT_RIGHT)
-                if flip_v:
-                    strip = strip.transpose(Image.FLIP_TOP_BOTTOM)
-                img_bytes = io.BytesIO()
-                strip.save(img_bytes, format="PNG")
-                return img_bytes.getvalue()
+                def crop_resize(box, size, flip_h=False, flip_v=False):
+                    box = clamp_crop_box(*box, page_w_px, page_h_px)
+                    strip = page_img.crop(box)
+                    strip = strip.resize(size, Image.LANCZOS)
+                    if flip_h:
+                        strip = strip.transpose(Image.FLIP_LEFT_RIGHT)
+                    if flip_v:
+                        strip = strip.transpose(Image.FLIP_TOP_BOTTOM)
+                    img_bytes = io.BytesIO()
+                    strip.save(img_bytes, format="PNG")
+                    return img_bytes.getvalue()
 
-            def create_bleed_image(side, flip_h=False, flip_v=False):
-                if side == "top":
-                    return crop_resize(
-                        (0, inset_top, page_w_px, inset_top + sample_px),
-                        (page_w_px, bleed_px),
-                        flip_h=flip_h, flip_v=flip_v,
-                    )
-                if side == "bottom":
-                    return crop_resize(
-                        (0, page_h_px - inset_bottom - sample_px, page_w_px, page_h_px - inset_bottom),
-                        (page_w_px, bleed_px),
-                        flip_h=flip_h, flip_v=flip_v,
-                    )
-                if side == "left":
-                    return crop_resize(
-                        (inset_left, 0, inset_left + sample_px, page_h_px),
-                        (bleed_px, page_h_px),
-                        flip_h=flip_h, flip_v=flip_v,
-                    )
-                if side == "right":
-                    return crop_resize(
-                        (page_w_px - inset_right - sample_px, 0, page_w_px - inset_right, page_h_px),
-                        (bleed_px, page_h_px),
-                        flip_h=flip_h, flip_v=flip_v,
-                    )
-                if side == "tl":
-                    return crop_resize(
-                        (inset_left, inset_top, inset_left + sample_px, inset_top + sample_px),
-                        (bleed_px, bleed_px),
-                        flip_h=flip_h, flip_v=flip_v,
-                    )
-                if side == "tr":
-                    return crop_resize(
-                        (page_w_px - inset_right - sample_px, inset_top, page_w_px - inset_right, inset_top + sample_px),
-                        (bleed_px, bleed_px),
-                        flip_h=flip_h, flip_v=flip_v,
-                    )
-                if side == "bl":
-                    return crop_resize(
-                        (inset_left, page_h_px - inset_bottom - sample_px, inset_left + sample_px, page_h_px - inset_bottom),
-                        (bleed_px, bleed_px),
-                        flip_h=flip_h, flip_v=flip_v,
-                    )
-                if side == "br":
-                    return crop_resize(
-                        (page_w_px - inset_right - sample_px, page_h_px - inset_bottom - sample_px, page_w_px - inset_right, page_h_px - inset_bottom),
-                        (bleed_px, bleed_px),
-                        flip_h=flip_h, flip_v=flip_v,
-                    )
-                raise ValueError(f"Unknown bleed side: {side}")
+                def create_bleed_image(side, flip_h=False, flip_v=False):
+                    if side == "top":
+                        return crop_resize(
+                            (0, inset_top, page_w_px, inset_top + sample_px),
+                            (page_w_px, bleed_px),
+                            flip_h=flip_h, flip_v=flip_v,
+                        )
+                    if side == "bottom":
+                        return crop_resize(
+                            (0, page_h_px - inset_bottom - sample_px, page_w_px, page_h_px - inset_bottom),
+                            (page_w_px, bleed_px),
+                            flip_h=flip_h, flip_v=flip_v,
+                        )
+                    if side == "left":
+                        return crop_resize(
+                            (inset_left, 0, inset_left + sample_px, page_h_px),
+                            (bleed_px, page_h_px),
+                            flip_h=flip_h, flip_v=flip_v,
+                        )
+                    if side == "right":
+                        return crop_resize(
+                            (page_w_px - inset_right - sample_px, 0, page_w_px - inset_right, page_h_px),
+                            (bleed_px, page_h_px),
+                            flip_h=flip_h, flip_v=flip_v,
+                        )
+                    if side == "tl":
+                        return crop_resize(
+                            (inset_left, inset_top, inset_left + sample_px, inset_top + sample_px),
+                            (bleed_px, bleed_px),
+                            flip_h=flip_h, flip_v=flip_v,
+                        )
+                    if side == "tr":
+                        return crop_resize(
+                            (page_w_px - inset_right - sample_px, inset_top, page_w_px - inset_right, inset_top + sample_px),
+                            (bleed_px, bleed_px),
+                            flip_h=flip_h, flip_v=flip_v,
+                        )
+                    if side == "bl":
+                        return crop_resize(
+                            (inset_left, page_h_px - inset_bottom - sample_px, inset_left + sample_px, page_h_px - inset_bottom),
+                            (bleed_px, bleed_px),
+                            flip_h=flip_h, flip_v=flip_v,
+                        )
+                    if side == "br":
+                        return crop_resize(
+                            (page_w_px - inset_right - sample_px, page_h_px - inset_bottom - sample_px, page_w_px - inset_right, page_h_px - inset_bottom),
+                            (bleed_px, bleed_px),
+                            flip_h=flip_h, flip_v=flip_v,
+                        )
+                    raise ValueError(f"Unknown bleed side: {side}")
 
-            new_page.insert_image(
-                fitz.Rect(bleed_pts, -outer_bleed_overlap_pts, w + bleed_pts, bleed_pts + seam_cover_pts["top"]),
-                stream=create_bleed_image("top", flip_v=True),
-            )
-            new_page.insert_image(
-                fitz.Rect(bleed_pts, h + bleed_pts - seam_cover_pts["bottom"], w + bleed_pts, new_h + outer_bleed_overlap_pts),
-                stream=create_bleed_image("bottom", flip_v=True),
-            )
-            new_page.insert_image(
-                fitz.Rect(-outer_bleed_overlap_pts, bleed_pts, bleed_pts + seam_cover_pts["left"], h + bleed_pts),
-                stream=create_bleed_image("left", flip_h=True),
-            )
-            new_page.insert_image(
-                fitz.Rect(w + bleed_pts - seam_cover_pts["right"], bleed_pts, new_w + outer_bleed_overlap_pts, h + bleed_pts),
-                stream=create_bleed_image("right", flip_h=True),
-            )
-            new_page.insert_image(
-                fitz.Rect(-outer_bleed_overlap_pts, -outer_bleed_overlap_pts, bleed_pts + seam_cover_pts["left"], bleed_pts + seam_cover_pts["top"]),
-                stream=create_bleed_image("tl", flip_h=True, flip_v=True),
-            )
-            new_page.insert_image(
-                fitz.Rect(w + bleed_pts - seam_cover_pts["right"], -outer_bleed_overlap_pts, new_w + outer_bleed_overlap_pts, bleed_pts + seam_cover_pts["top"]),
-                stream=create_bleed_image("tr", flip_h=True, flip_v=True),
-            )
-            new_page.insert_image(
-                fitz.Rect(-outer_bleed_overlap_pts, h + bleed_pts - seam_cover_pts["bottom"], bleed_pts + seam_cover_pts["left"], new_h + outer_bleed_overlap_pts),
-                stream=create_bleed_image("bl", flip_h=True, flip_v=True),
-            )
-            new_page.insert_image(
-                fitz.Rect(w + bleed_pts - seam_cover_pts["right"], h + bleed_pts - seam_cover_pts["bottom"], new_w + outer_bleed_overlap_pts, new_h + outer_bleed_overlap_pts),
-                stream=create_bleed_image("br", flip_h=True, flip_v=True),
-            )
+                new_page.insert_image(
+                    fitz.Rect(bleed_pts, -outer_bleed_overlap_pts, w + bleed_pts, bleed_pts + seam_cover_pts["top"]),
+                    stream=create_bleed_image("top", flip_v=True),
+                )
+                new_page.insert_image(
+                    fitz.Rect(bleed_pts, h + bleed_pts - seam_cover_pts["bottom"], w + bleed_pts, new_h + outer_bleed_overlap_pts),
+                    stream=create_bleed_image("bottom", flip_v=True),
+                )
+                new_page.insert_image(
+                    fitz.Rect(-outer_bleed_overlap_pts, bleed_pts, bleed_pts + seam_cover_pts["left"], h + bleed_pts),
+                    stream=create_bleed_image("left", flip_h=True),
+                )
+                new_page.insert_image(
+                    fitz.Rect(w + bleed_pts - seam_cover_pts["right"], bleed_pts, new_w + outer_bleed_overlap_pts, h + bleed_pts),
+                    stream=create_bleed_image("right", flip_h=True),
+                )
+                new_page.insert_image(
+                    fitz.Rect(-outer_bleed_overlap_pts, -outer_bleed_overlap_pts, bleed_pts + seam_cover_pts["left"], bleed_pts + seam_cover_pts["top"]),
+                    stream=create_bleed_image("tl", flip_h=True, flip_v=True),
+                )
+                new_page.insert_image(
+                    fitz.Rect(w + bleed_pts - seam_cover_pts["right"], -outer_bleed_overlap_pts, new_w + outer_bleed_overlap_pts, bleed_pts + seam_cover_pts["top"]),
+                    stream=create_bleed_image("tr", flip_h=True, flip_v=True),
+                )
+                new_page.insert_image(
+                    fitz.Rect(-outer_bleed_overlap_pts, h + bleed_pts - seam_cover_pts["bottom"], bleed_pts + seam_cover_pts["left"], new_h + outer_bleed_overlap_pts),
+                    stream=create_bleed_image("bl", flip_h=True, flip_v=True),
+                )
+                new_page.insert_image(
+                    fitz.Rect(w + bleed_pts - seam_cover_pts["right"], h + bleed_pts - seam_cover_pts["bottom"], new_w + outer_bleed_overlap_pts, new_h + outer_bleed_overlap_pts),
+                    stream=create_bleed_image("br", flip_h=True, flip_v=True),
+                )
             if log_callback:
                 log_callback(f"  Page {page_index + 1}/{total_pages} completed")
             if progress_callback:
@@ -424,6 +474,7 @@ class App:
         self.batch_success_count = 0
         self.batch_fail_count = 0
         self.batch_output_files = []
+        self.last_vector_bleed = False
 
         if DND_AVAILABLE:
             self.root.drop_target_register(DND_FILES)
@@ -497,7 +548,7 @@ class App:
         self.subtitle_label.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 4))
 
         self.version_label = ctk.CTkLabel(
-            self.header_frame, text="V2.02\nMade by Douglas C.",
+            self.header_frame, text="V2.03\nMade by Douglas C.",
             font=("Segoe UI", 10, "bold"), justify="right",
         )
         self.version_label.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(0, 24), pady=(18, 4))
@@ -517,6 +568,16 @@ class App:
         )
         self.config_label.pack(side=ctk.LEFT)
 
+        self.insets_link_btn = ctk.CTkButton(
+            top_row, text="&",
+            width=34, height=30,
+            font=("Segoe UI", 14, "bold"),
+            corner_radius=8, cursor="hand2",
+            command=self._toggle_insets_link,
+        )
+        self.insets_link_btn.pack(side=ctk.LEFT, padx=(12, 0))
+        self.insets_linked = True
+
         self.theme_switch = ctk.CTkSwitch(
             top_row, text="", command=self._toggle_theme,
             progress_color="#3B82F6", corner_radius=12,
@@ -535,6 +596,7 @@ class App:
 
         self.edge_inset_vars = {}
         self.inset_labels = {}
+        self.inset_sliders = {}
 
         for row, (side_key, side_label) in enumerate([
             ("top", "White edge skip top"),
@@ -557,6 +619,7 @@ class App:
                 command=lambda val, key=side_key: self._update_inset_label(key),
             )
             inset_slider.grid(row=row, column=1, sticky="ew", padx=(14, 0), pady=(0, 10))
+            self.inset_sliders[side_key] = inset_slider
 
             self.inset_labels[side_key] = ctk.CTkLabel(
                 self.grid_frame, text="0 px",
@@ -593,10 +656,23 @@ class App:
             font=("Segoe UI", 11, "bold"),
             corner_radius=6,
             cursor="hand2",
+            command=self._on_flatten_toggle,
         )
         self.flatten_check.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
+        self.vector_bleed_var = ctk.BooleanVar(value=False)
+        self.vector_bleed_check = ctk.CTkCheckBox(
+            self.grid_frame, text="Vector mode (reduced file size)",
+            variable=self.vector_bleed_var,
+            font=("Segoe UI", 11, "bold"),
+            corner_radius=6,
+            cursor="hand2",
+            command=self._on_vector_bleed_toggle,
+        )
+        self.vector_bleed_check.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
         self._refresh_slider_labels()
+        self._apply_insets_link_state()
 
     def _build_files(self):
         self.files_card = ctk.CTkFrame(
@@ -747,6 +823,15 @@ class App:
             hover_color=c["input_border"],
         )
 
+        self.vector_bleed_check.configure(
+            fg_color=c["input_bg"],
+            text_color=c["text"],
+            border_color=c["input_border"],
+            hover_color=c["input_border"],
+        )
+
+        self._apply_insets_link_state()
+
         self.files_card.configure(fg_color=c["card"], border_color=c["card_border"])
         self.files_title.configure(text_color=c["text"])
 
@@ -803,6 +888,55 @@ class App:
     def _update_inset_label(self, side_key):
         inset_px = int(round(self.edge_inset_vars[side_key].get()))
         self.inset_labels[side_key].configure(text=f"{inset_px} px")
+        if self.insets_linked:
+            for key in self.edge_inset_vars:
+                if key != side_key:
+                    self.edge_inset_vars[key].set(inset_px)
+                    self.inset_labels[key].configure(text=f"{inset_px} px")
+
+    def _toggle_insets_link(self):
+        self.insets_linked = not self.insets_linked
+        if self.insets_linked:
+            top_value = int(round(self.edge_inset_vars["top"].get()))
+            for key in self.edge_inset_vars:
+                self.edge_inset_vars[key].set(top_value)
+            self._refresh_slider_labels()
+        self._apply_insets_link_state()
+
+    def _apply_insets_link_state(self):
+        c = self.palette
+        if self.insets_linked:
+            self.insets_link_btn.configure(
+                fg_color=c.get("primary", "#3B82F6"),
+                hover_color=c.get("primary_hover", "#2563EB"),
+                text_color="#FFFFFF",
+            )
+        else:
+            self.insets_link_btn.configure(
+                fg_color=c.get("input_bg", "#F1F5F9"),
+                hover_color=c.get("input_border", "#CBD5E1"),
+                text_color=c.get("text", "#334155"),
+            )
+
+    def _on_vector_bleed_toggle(self):
+        vector_on = bool(self.vector_bleed_var.get())
+        if vector_on:
+            self.flatten_page_var.set(False)
+        self._set_insets_enabled(not vector_on)
+
+    def _on_flatten_toggle(self):
+        if bool(self.flatten_page_var.get()):
+            self.vector_bleed_var.set(False)
+
+    def _set_insets_enabled(self, enabled):
+        state = ctk.NORMAL if enabled else ctk.DISABLED
+        for slider in self.inset_sliders.values():
+            slider.configure(state=state)
+        self.insets_link_btn.configure(state=state)
+        if not enabled:
+            for key, inset_var in self.edge_inset_vars.items():
+                self.inset_labels[key].configure(text=f"{int(round(inset_var.get()))} px")
+        self._apply_insets_link_state()
 
     def _snap_dpi(self, dpi):
         dpi = round(dpi / 30) * 30
@@ -924,12 +1058,16 @@ class App:
         edge_sample = self.edge_sample_inches
         bleed_dpi = int(self.bleed_dpi_var.get())
         flatten_page = bool(self.flatten_page_var.get())
+        vector_bleed = bool(self.vector_bleed_var.get())
+        if vector_bleed and flatten_page:
+            flatten_page = False
         edge_inset_px = {
             side_key: int(round(inset_var.get()))
             for side_key, inset_var in self.edge_inset_vars.items()
         }
         self.last_edge_insets = edge_inset_px.copy()
         self.last_flatten_page = flatten_page
+        self.last_vector_bleed = vector_bleed
         edge_skip_summary = (
             f"Top {edge_inset_px['top']}px | Bottom {edge_inset_px['bottom']}px | "
             f"Left {edge_inset_px['left']}px | Right {edge_inset_px['right']}px"
@@ -939,17 +1077,19 @@ class App:
         self.write_log("=" * 60)
         self.write_log(f"Files to process: {len(self.input_files)}")
         self.write_log("Bleed: 0.125\" (9 points)")
-        self.write_log(f"Internal Edge Sample: {edge_sample:.2f}\"")
-        self.write_log(f"White Edge Skip: {edge_skip_summary}")
-        self.write_log(f"Bleed DPI: {bleed_dpi}")
-        self.write_log(f"Flatten Transparency Mode: {'ON' if flatten_page else 'OFF'}")
-        self.write_log("Method: Edge Extension with inset sampling")
+        self.write_log(f"Bleed Mode: {'Vector Mirror (reduced size)' if vector_bleed else f'Raster @ {bleed_dpi} DPI'}")
+        if not vector_bleed:
+            self.write_log(f"Internal Edge Sample: {edge_sample:.2f}\"")
+            self.write_log(f"White Edge Skip: {edge_skip_summary}")
+            self.write_log(f"Bleed DPI: {bleed_dpi}")
+            self.write_log(f"Flatten Transparency Mode: {'ON' if flatten_page else 'OFF'}")
+            self.write_log("Method: Edge Extension with inset sampling")
         self.write_log("=" * 60)
 
         files = list(self.input_files)
         thread = threading.Thread(
             target=self.run_batch,
-            args=(files, edge_sample, bleed_dpi, edge_inset_px, flatten_page),
+            args=(files, edge_sample, bleed_dpi, edge_inset_px, flatten_page, vector_bleed),
             daemon=True,
         )
         thread.start()
@@ -965,7 +1105,7 @@ class App:
                 total += 1
         return total
 
-    def run_batch(self, files, edge_sample, bleed_dpi, edge_inset_px, flatten_page):
+    def run_batch(self, files, edge_sample, bleed_dpi, edge_inset_px, flatten_page, vector_bleed=False):
         total_pages_all = self.compute_total_pages(files)
         pages_done = 0
         self.batch_success_count = 0
@@ -1001,6 +1141,7 @@ class App:
                 bleed_dpi=bleed_dpi,
                 edge_inset_px=edge_inset_px,
                 flatten_page=flatten_page,
+                vector_bleed=vector_bleed,
             )
 
             pages_done += pages_in_file
@@ -1025,6 +1166,7 @@ class App:
             f"Left {self.last_edge_insets['left']}px | Right {self.last_edge_insets['right']}px"
         )
         flatten_summary = "ON" if self.last_flatten_page else "OFF"
+        vector_summary = "ON" if self.last_vector_bleed else "OFF"
 
         self.write_log("")
         self.write_log("=" * 60)
@@ -1039,7 +1181,7 @@ class App:
             self.show_success(
                 "Success",
                 f"All {total} PDF(s) processed successfully.\n\n"
-                f"{int(self.bleed_dpi_var.get())} DPI bleed quality\n"
+                f"Bleed mode: {'Vector Mirror (reduced size)' if vector_summary == 'ON' else f'{int(self.bleed_dpi_var.get())} DPI raster'}\n"
                 f"White edge skip applied: {edge_skip_summary}\n"
                 f"Flatten transparency mode: {flatten_summary}\n"
                 "Ready for professional print",
